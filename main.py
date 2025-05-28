@@ -4,36 +4,39 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from contextlib import asynccontextmanager
 
-# Import routers
-from routers import (
-    texture_router,
-    temperature_router,
-    geographic_router,
-    format_router,
-    applications_router,
-    category_router,
-    subcategory_router,
-    recipe_share_router,
-    menu_share_router,
-    lifecycle_router,
-    flavor_profile_router,
-    cuisine_router,
-    category_penetration_router,
-    trending_router,
-    phase_router
-)
-from database.connection import close_db_connection, get_connection_info, get_db_connection, test_motherduck_connection
+# Import routers directly
+
+from routers.summary_stats_router import router as summary_stats_router
+from routers.general_trends_router import router as general_trends_router
+from routers.season_router import router as season_router
+
+from routers.category_analysis_router import router as category_analysis_router
+from routers.category_trends_router import router as category_trends_router
+from routers.cuisine_analysis_router import router as cuisine_analysis_router
+from routers.subcategory_analysis_router import router as subcategory_analysis_router
+from routers.dish_router import router as dish_router
+
+from routers.applications_router import router as applications_router
+from routers.pairings_router import router as pairings_router
+
+from routers.consumer_insights_attributes_router import router as consumer_insights_attributes_router
+# from routers.consumer_insights_flavor_router import router as consumer_insights_flavor_router
+
+
+
+
+from database.connection import close_db_connection, get_db_connection
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup - pre-warm database connection
     print("Starting up FlavorLens API...")
+    await get_db_connection()  # Establish connection at startup
     yield
     # Shutdown
     print("Shutting down FlavorLens API...")
     await close_db_connection()
 
-# Make sure this is at module level, not inside any function
 app = FastAPI(
     title="FlavorLens API",
     description="API for ingredient analytics and food trend insights",
@@ -53,21 +56,28 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(texture_router.router, prefix="/api", tags=["texture"])
-app.include_router(temperature_router.router, prefix="/api", tags=["temperature"])
-app.include_router(geographic_router.router, prefix="/api", tags=["geographic"])
-app.include_router(format_router.router, prefix="/api", tags=["format"])
-app.include_router(applications_router.router, prefix="/api", tags=["applications"])
-app.include_router(category_router.router, prefix="/api", tags=["category"])
-app.include_router(subcategory_router.router, prefix="/api", tags=["subcategory"])
-app.include_router(recipe_share_router.router, prefix="/api", tags=["recipe"])
-app.include_router(menu_share_router.router, prefix="/api", tags=["menu"])
-app.include_router(lifecycle_router.router, prefix="/api", tags=["lifecycle"])
-app.include_router(flavor_profile_router.router, prefix="/api", tags=["flavor"])
-app.include_router(cuisine_router.router, prefix="/api", tags=["cuisine"])
-app.include_router(category_penetration_router.router, prefix="/api", tags=["penetration"])
-app.include_router(trending_router.router, prefix="/api", tags=["trending"])
-app.include_router(phase_router.router, prefix="/api") 
+# app.include_router(temperature_router, prefix="/api", tags=["temperature"])
+# app.include_router(geographic_router, prefix="/api", tags=["geographic"])
+# app.include_router(format_router, prefix="/api", tags=["format"])
+
+app.include_router(summary_stats_router, prefix="/api", tags=["summary-stats"])
+app.include_router(general_trends_router, prefix="/api", tags=["general-trends"])
+app.include_router(season_router, prefix="/api", tags=["season"])
+
+app.include_router(category_analysis_router, prefix="/api", tags=["category-analysis"])
+app.include_router(category_trends_router, prefix="/api", tags=["category-trends"])
+app.include_router(cuisine_analysis_router, prefix="/api", tags=["cuisine-analysis"])
+app.include_router(subcategory_analysis_router, prefix="/api", tags=["subcategory-distribution"])
+app.include_router(dish_router, prefix="/api", tags=["dish"])
+
+app.include_router(applications_router, prefix="/api", tags=["applications"])
+app.include_router(pairings_router, prefix="/api", tags=["pairings"])
+app.include_router(consumer_insights_attributes_router, prefix="/api", tags=["consumer-insights-attributes"])
+# app.include_router(consumer_insights_flavor_router, prefix="/api", tags=["consumer-insights-flavor"])
+
+
+
+
 
 @app.get("/")
 async def root():
@@ -77,21 +87,6 @@ async def root():
 async def health_check():
     return {"status": "API is working"}
 
-# Add this to main.py after your other endpoints
-
-from database.connection import get_connection_info, test_motherduck_connection
-
-@app.get("/debug/connection")
-async def debug_connection():
-    """Get detailed connection information"""
-    return await get_connection_info()
-
-@app.get("/debug/test-motherduck")
-async def debug_test_motherduck():
-    """Test MotherDuck connection with detailed diagnostics"""
-    return await test_motherduck_connection()
-
-# This should be at the bottom
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
