@@ -3,6 +3,7 @@ from database.connection import execute_query, QueryOptions
 from pydantic import BaseModel
 from typing import List, Optional
 from config import CURRENT_YEAR
+import math
 
 router = APIRouter()
 
@@ -23,15 +24,30 @@ class PairingData(BaseModel):
     top_dishes: List[str]
     general_categories: List[str]
 
+class PaginationInfo(BaseModel):
+    current_page: int
+    total_pages: int
+    total_items: int
+    items_per_page: int
+    has_next: bool
+    has_previous: bool
+
 class PairingsResponse(BaseModel):
     ingredient: str
     pairings: List[PairingData]
     total_pairings: int
+    pagination: PaginationInfo
 
 @router.get("/pairings", response_model=PairingsResponse)
 async def get_ingredient_pairings(
     ingredient: str = Query(..., description="Ingredient name"),
-    category: str = Query(None, description="General category filter (optional)")
+    category: str = Query(None, description="General category filter (optional)"),
+    page: int = Query(1, ge=1, description="Page number (starts from 1)"),
+    limit: int = Query(25, ge=1, le=100, description="Items per page (max 100)"),
+    sort_by: str = Query("share_percent", description="Sort column: share_percent, growth, appeal_score, dominant_ingredient_percent, title"),
+    sort_direction: str = Query("desc", description="Sort direction: asc or desc"),
+    lifecycle_phase: str = Query(None, description="Lifecycle phase filter: emerging, growing, mature, declining"),
+    search: str = Query(None, description="Search in pairing titles")
 ):
     try:
         previous_year = CURRENT_YEAR - 1
@@ -40,8 +56,8 @@ async def get_ingredient_pairings(
         base_where = f"base_ingredient ILIKE '%{ingredient}%'"
         pairing_where = f"base_ingredient ILIKE '%{ingredient}%' AND paired_flavor_role != 'background'"
         
+        # Category filter
         if category and category.lower() != "all categories":
-            # Escape single quotes safely outside the f-string
             safe_category = category.replace("'", "''")
             category_condition = f"AND general_category = '{safe_category}'"
             base_where = base_where + " " + category_condition
@@ -50,8 +66,34 @@ async def get_ingredient_pairings(
         else:
             print("No category filter applied")
         
-        # Build the complete query with proper string substitution
-        query = f"""
+        # Build additional filters for the final WHERE clause
+        additional_filters = []
+        
+        if lifecycle_phase and lifecycle_phase.lower() != "all":
+            safe_phase = lifecycle_phase.replace("'", "''")
+            additional_filters.append(f"gc.lifecycle_phase = '{safe_phase}'")
+            
+        if search:
+            safe_search = search.replace("'", "''")
+            additional_filters.append(f"gc.paired_ingredient ILIKE '%{safe_search}%'")
+        
+        # Build the sorting clause
+        sort_mapping = {
+            "share_percent": "gc.share_percentage",
+            "growth": "gc.growth_rate", 
+            "appeal_score": "gc.appeal_score",
+            "dominant_ingredient_percent": "base_dominant_percent",
+            "title": "gc.paired_ingredient"
+        }
+        
+        sort_column = sort_mapping.get(sort_by, "gc.share_percentage")
+        sort_dir = "ASC" if sort_direction.lower() == "asc" else "DESC"
+        
+        # Calculate offset for pagination
+        offset = (page - 1) * limit
+        
+        # First, get the total count with filters applied
+        count_query = f"""
         WITH base_ingredient_data AS (
             SELECT COUNT(DISTINCT dish_id) as total_base_dishes
             FROM ingredient_pairings 
@@ -148,7 +190,139 @@ async def get_ingredient_pairings(
                         END
                     ) < -5 THEN 'declining'
                     ELSE 'mature'
-                END AS lifecycle_phase
+                END AS lifecycle_phase,
+                CASE 
+                    WHEN pm.unique_dishes = 0 THEN 0
+                    ELSE ROUND(pm.base_dominant_count * 100.0 / pm.unique_dishes, 0)
+                END AS base_dominant_percent,
+                CASE 
+                    WHEN pm.unique_dishes = 0 THEN 0
+                    ELSE ROUND(pm.paired_dominant_count * 100.0 / pm.unique_dishes, 0)
+                END AS paired_dominant_percent
+            FROM pairing_metrics pm
+            LEFT JOIN yearly_pairing_data prev_year ON pm.paired_ingredient = prev_year.paired_ingredient AND prev_year.year = {previous_year}
+            LEFT JOIN yearly_pairing_data curr_year ON pm.paired_ingredient = curr_year.paired_ingredient AND curr_year.year = {CURRENT_YEAR}
+        )
+        SELECT COUNT(*) as total_count
+        FROM growth_calculation gc
+        WHERE gc.unique_dishes >= 3
+        """
+        
+        # Add additional filters to count query
+        if additional_filters:
+            count_query += " AND " + " AND ".join(additional_filters)
+        
+        count_result = await execute_query(count_query)
+        total_items = count_result["rows"][0]["total_count"] if count_result["rows"] else 0
+        total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+        
+        # Now get the paginated data
+        main_query = f"""
+        WITH base_ingredient_data AS (
+            SELECT COUNT(DISTINCT dish_id) as total_base_dishes
+            FROM ingredient_pairings 
+            WHERE {base_where}
+        ),
+        base_ingredient_by_year AS (
+            SELECT 
+                year,
+                COUNT(DISTINCT dish_id) as base_dishes_by_year
+            FROM ingredient_pairings 
+            WHERE {base_where}
+            GROUP BY year
+        ),
+        yearly_pairing_data AS (
+            SELECT 
+                paired_ingredient,
+                year,
+                COUNT(DISTINCT dish_id) AS yearly_dishes,
+                ROUND(
+                    COUNT(DISTINCT dish_id) * 100.0 / 
+                    NULLIF((
+                        SELECT base_dishes_by_year 
+                        FROM base_ingredient_by_year biy 
+                        WHERE biy.year = ip.year
+                    ), 0), 
+                    2
+                ) AS yearly_penetration
+            FROM ingredient_pairings ip
+            WHERE {pairing_where}
+                AND year IN ({previous_year}, {CURRENT_YEAR})
+            GROUP BY paired_ingredient, year
+        ),
+        pairing_metrics AS (
+            SELECT 
+                paired_ingredient,
+                COUNT(DISTINCT dish_id) AS unique_dishes,
+                CASE 
+                    WHEN (SELECT total_base_dishes FROM base_ingredient_data) = 0 THEN 0.0
+                    ELSE ROUND(COUNT(DISTINCT dish_id) * 100.0 / 
+                        (SELECT total_base_dishes FROM base_ingredient_data), 1)
+                END AS share_percentage,
+                ROUND(AVG(star_rating) * 20, 0) AS appeal_score,
+                AVG(star_rating) AS avg_rating,
+                COUNT(DISTINCT CASE WHEN base_flavor_role = 'dominant' THEN dish_id END) AS base_dominant_count,
+                COUNT(DISTINCT CASE WHEN paired_flavor_role = 'dominant' THEN dish_id END) AS paired_dominant_count
+            FROM ingredient_pairings
+            WHERE {pairing_where}
+            GROUP BY paired_ingredient
+        ),
+        growth_calculation AS (
+            SELECT 
+                pm.paired_ingredient,
+                pm.unique_dishes,
+                pm.share_percentage,
+                pm.appeal_score,
+                pm.avg_rating,
+                pm.base_dominant_count,
+                pm.paired_dominant_count,
+                CASE 
+                    WHEN prev_year.yearly_penetration IS NULL OR prev_year.yearly_penetration = 0 THEN 
+                        CASE 
+                            WHEN curr_year.yearly_penetration > 0 THEN 100.0
+                            ELSE 0.0
+                        END
+                    ELSE 
+                        ROUND(
+                            ((curr_year.yearly_penetration - prev_year.yearly_penetration) / prev_year.yearly_penetration) * 100, 
+                            1
+                        )
+                END AS growth_rate,
+                CASE 
+                    WHEN pm.share_percentage < 5 AND (
+                        CASE 
+                            WHEN prev_year.yearly_penetration IS NULL OR prev_year.yearly_penetration = 0 THEN 
+                                CASE WHEN curr_year.yearly_penetration > 0 THEN 100.0 ELSE 0.0 END
+                            ELSE 
+                                ROUND(((curr_year.yearly_penetration - prev_year.yearly_penetration) / prev_year.yearly_penetration) * 100, 1)
+                        END
+                    ) > 15 THEN 'emerging'
+                    WHEN pm.share_percentage BETWEEN 5 AND 25 AND (
+                        CASE 
+                            WHEN prev_year.yearly_penetration IS NULL OR prev_year.yearly_penetration = 0 THEN 
+                                CASE WHEN curr_year.yearly_penetration > 0 THEN 100.0 ELSE 0.0 END
+                            ELSE 
+                                ROUND(((curr_year.yearly_penetration - prev_year.yearly_penetration) / prev_year.yearly_penetration) * 100, 1)
+                        END
+                    ) > 5 THEN 'growing'
+                    WHEN pm.share_percentage >= 25 AND (
+                        CASE 
+                            WHEN prev_year.yearly_penetration IS NULL OR prev_year.yearly_penetration = 0 THEN 
+                                CASE WHEN curr_year.yearly_penetration > 0 THEN 100.0 ELSE 0.0 END
+                            ELSE 
+                                ROUND(((curr_year.yearly_penetration - prev_year.yearly_penetration) / prev_year.yearly_penetration) * 100, 1)
+                        END
+                    ) < -5 THEN 'declining'
+                    ELSE 'mature'
+                END AS lifecycle_phase,
+                CASE 
+                    WHEN pm.unique_dishes = 0 THEN 0
+                    ELSE ROUND(pm.base_dominant_count * 100.0 / pm.unique_dishes, 0)
+                END AS base_dominant_percent,
+                CASE 
+                    WHEN pm.unique_dishes = 0 THEN 0
+                    ELSE ROUND(pm.paired_dominant_count * 100.0 / pm.unique_dishes, 0)
+                END AS paired_dominant_percent
             FROM pairing_metrics pm
             LEFT JOIN yearly_pairing_data prev_year ON pm.paired_ingredient = prev_year.paired_ingredient AND prev_year.year = {previous_year}
             LEFT JOIN yearly_pairing_data curr_year ON pm.paired_ingredient = curr_year.paired_ingredient AND curr_year.year = {CURRENT_YEAR}
@@ -213,14 +387,8 @@ async def get_ingredient_pairings(
             gc.lifecycle_phase,
             gc.appeal_score,
             gc.avg_rating,
-            CASE 
-                WHEN gc.unique_dishes = 0 THEN 0
-                ELSE ROUND(gc.base_dominant_count * 100.0 / gc.unique_dishes, 0)
-            END AS base_dominant_percent,
-            CASE 
-                WHEN gc.unique_dishes = 0 THEN 0
-                ELSE ROUND(gc.paired_dominant_count * 100.0 / gc.unique_dishes, 0)
-            END AS paired_dominant_percent,
+            gc.base_dominant_percent,
+            gc.paired_dominant_percent,
             COALESCE(ab.applications_data, '') AS applications_data,
             COALESCE(ab.general_categories, '') AS general_categories,
             COALESCE(td.top_dishes_data, '') AS top_dishes_data,
@@ -229,7 +397,16 @@ async def get_ingredient_pairings(
         LEFT JOIN application_breakdown ab ON gc.paired_ingredient = ab.paired_ingredient
         LEFT JOIN top_dishes_agg td ON gc.paired_ingredient = td.paired_ingredient
         WHERE gc.unique_dishes >= 3
-        ORDER BY gc.share_percentage DESC;
+        """
+        
+        # Add additional filters to main query
+        if additional_filters:
+            main_query += " AND " + " AND ".join(additional_filters)
+            
+        # Add sorting and pagination
+        main_query += f"""
+        ORDER BY {sort_column} {sort_dir}
+        LIMIT {limit} OFFSET {offset};
         """
 
         # Debug: Check if category filtering is working
@@ -243,16 +420,24 @@ async def get_ingredient_pairings(
             debug_result = await execute_query(debug_query)
             print(f"Debug - Category '{category}' results: {debug_result['rows'][0] if debug_result['rows'] else 'No data'}")
         
-        result = await execute_query(query)
+        result = await execute_query(main_query)
         
         if not result["rows"]:
             return PairingsResponse(
                 ingredient=ingredient,
                 pairings=[],
-                total_pairings=0
+                total_pairings=total_items,
+                pagination=PaginationInfo(
+                    current_page=page,
+                    total_pages=total_pages,
+                    total_items=total_items,
+                    items_per_page=limit,
+                    has_next=False,
+                    has_previous=False
+                )
             )
 
-        print(f"Sample penetration data for {ingredient}:")
+        print(f"Sample penetration data for {ingredient} (page {page}):")
         sample_penetrations = [row["share_percentage"] for row in result["rows"][:5]]
         print(f"Penetration debug: {sample_penetrations if sample_penetrations else 'No penetration data'}")
 
@@ -309,7 +494,15 @@ async def get_ingredient_pairings(
         return PairingsResponse(
             ingredient=ingredient,
             pairings=pairings,
-            total_pairings=len(pairings)
+            total_pairings=total_items,
+            pagination=PaginationInfo(
+                current_page=page,
+                total_pages=total_pages,
+                total_items=total_items,
+                items_per_page=limit,
+                has_next=page < total_pages,
+                has_previous=page > 1
+            )
         )
 
     except Exception as e:

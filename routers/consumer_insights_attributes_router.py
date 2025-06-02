@@ -340,7 +340,7 @@ def generate_attribute_insights(attributes, trends, raw_attributes, ingredient, 
                 insights["growing_trend"] = growing[0]
                 insights["declining_trend"] = declining[0]
                 
-                insights["trend_summary"] = f"Over the analysis period, {growing[0]} {attribute_type} preferences have grown by {growing[1]:.1f}%, while {declining[0]} preferences have declined by {abs(declining[1]):.1f}%."
+                insights["trend_summary"] = f"Over the analysis period, {growing[0]} {attribute_type.value} preferences have grown by {growing[1]:.1f}%, while {declining[0]} preferences have declined by {abs(declining[1]):.1f}%."
     
     # Process raw attributes
     if raw_attributes:
