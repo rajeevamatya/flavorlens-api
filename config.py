@@ -33,8 +33,8 @@ class Settings(BaseSettings):
         "http://localhost:8000",      # FastAPI running locally
         "http://127.0.0.1:3000",      # Alternative localhost address
         "http://127.0.0.1:8000",      # Alternative localhost address
-        "https://flavorlens.app",     # Production web app (add your domain)
-        "https://www.flavorlens.app"  # Production web app with www
+        "https://flavorlens.vercel.app/",     # Production web app (add your domain)
+        "https://www.flavorlens.vercel.app/"  # Production web app with www
     ]
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
