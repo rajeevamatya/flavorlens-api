@@ -28,13 +28,15 @@ class Settings(BaseSettings):
     enable_caching: bool = True
     
     # CORS settings - Updated for proper cross-origin communication
+    # CORS settings - Updated for proper cross-origin communication
     cors_origins: List[str] = [
         "http://localhost:3000",      # Next.js development server
         "http://localhost:8000",      # FastAPI running locally
         "http://127.0.0.1:3000",      # Alternative localhost address
         "http://127.0.0.1:8000",      # Alternative localhost address
-        "https://flavorlens.vercel.app/",     # Production web app (add your domain)
-        "https://www.flavorlens.vercel.app/"  # Production web app with www
+        "https://flavorlens.vercel.app",     # Remove trailing slash
+        "https://www.flavorlens.vercel.app", # Remove trailing slash
+        "https://*.vercel.app",              # Add wildcard for preview deployments
     ]
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
