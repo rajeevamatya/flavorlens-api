@@ -33,20 +33,64 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
     try:
         ingredient_pattern = f"'%{ingredient}%'"
         
-        # Query across ALL years for better analysis
+        # First, let's debug what seasons actually exist in the data
+        debug_query = f"""
+        SELECT DISTINCT 
+            season,
+            UPPER(TRIM(season)) as normalized_season,
+            COUNT(DISTINCT dish_id) as dish_count
+        FROM ingredient_details
+        WHERE ingredient_name ILIKE {ingredient_pattern}
+            AND season IS NOT NULL
+            AND TRIM(season) != ''
+        GROUP BY season
+        ORDER BY dish_count DESC;
+        """
+        
+        debug_result = await execute_query(debug_query)
+        print(f"Available seasons for {ingredient}: {debug_result['rows'] if debug_result['rows'] else 'No season data'}")
+        
+        # Query with case-insensitive season matching - calculate against overall dataset
         seasonal_query = f"""
-        WITH ingredient_by_season AS (
+        WITH overall_ingredient_dishes AS (
+            -- Get total dishes containing this ingredient across all data
+            SELECT COUNT(DISTINCT dish_id) AS total_dishes
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+        ),
+        ingredient_by_season AS (
             SELECT 
-                COALESCE(season, 'All-Season') AS season,
+                CASE 
+                    WHEN LOWER(TRIM(season)) = 'spring' THEN 'Spring'
+                    WHEN LOWER(TRIM(season)) = 'summer' THEN 'Summer'
+                    WHEN LOWER(TRIM(season)) = 'fall' THEN 'Fall'
+                    WHEN LOWER(TRIM(season)) = 'winter' THEN 'Winter'
+                    WHEN LOWER(TRIM(season)) = 'all-season' THEN 'All-Season'
+                    ELSE NULL  -- Don't categorize unknown seasons
+                END AS normalized_season,
                 COUNT(DISTINCT dish_id) AS ingredient_dishes
             FROM ingredient_details
             WHERE ingredient_name ILIKE {ingredient_pattern}
-            GROUP BY COALESCE(season, 'All-Season')
-        ),
-        total_ingredient_dishes AS (
-            SELECT COUNT(DISTINCT dish_id) AS total
-            FROM ingredient_details
-            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND season IS NOT NULL
+                AND TRIM(season) != ''
+            GROUP BY 
+                CASE 
+                    WHEN LOWER(TRIM(season)) = 'spring' THEN 'Spring'
+                    WHEN LOWER(TRIM(season)) = 'summer' THEN 'Summer'
+                    WHEN LOWER(TRIM(season)) = 'fall' THEN 'Fall'
+                    WHEN LOWER(TRIM(season)) = 'winter' THEN 'Winter'
+                    WHEN LOWER(TRIM(season)) = 'all-season' THEN 'All-Season'
+                    ELSE NULL
+                END
+            HAVING 
+                CASE 
+                    WHEN LOWER(TRIM(season)) = 'spring' THEN 'Spring'
+                    WHEN LOWER(TRIM(season)) = 'summer' THEN 'Summer'
+                    WHEN LOWER(TRIM(season)) = 'fall' THEN 'Fall'
+                    WHEN LOWER(TRIM(season)) = 'winter' THEN 'Winter'
+                    WHEN LOWER(TRIM(season)) = 'all-season' THEN 'All-Season'
+                    ELSE NULL
+                END IS NOT NULL
         ),
         all_seasons AS (
             SELECT season FROM (VALUES ('Spring'),('Summer'),('Fall'),('Winter'),('All-Season')) AS s(season)
@@ -54,14 +98,14 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
         SELECT 
             s.season AS name,
             ROUND(
-                COALESCE(ibs.ingredient_dishes, 0) * 100.0 / NULLIF(tid.total, 0), 
+                COALESCE(ibs.ingredient_dishes, 0) * 100.0 / NULLIF(oid.total_dishes, 0), 
                 2
             ) AS value,
             COALESCE(ibs.ingredient_dishes, 0) AS dish_count,
-            tid.total AS total_dishes
+            oid.total_dishes AS total_dishes
         FROM all_seasons s
-        LEFT JOIN ingredient_by_season ibs ON s.season = ibs.season
-        CROSS JOIN total_ingredient_dishes tid
+        LEFT JOIN ingredient_by_season ibs ON s.season = ibs.normalized_season
+        CROSS JOIN overall_ingredient_dishes oid
         ORDER BY 
             CASE 
                 WHEN s.season = 'Spring' THEN 1
@@ -84,6 +128,8 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
         # Parse distribution data
         distribution = []
         total_dishes = 0
+        
+        print(f"Season distribution results: {result['rows']}")
         
         for row in result["rows"]:
             distribution.append(SeasonDistribution(

@@ -3,12 +3,13 @@ from fastapi import APIRouter, HTTPException, Query
 from database.connection import execute_query, QueryOptions
 from pydantic import BaseModel
 from typing import List, Optional
+from config import CURRENT_YEAR  # Import CURRENT_YEAR from config
 
 class CategoryDistribution(BaseModel):
     name: str
     value: float
     dish_count: int
-    count_2023: int
+    count_previous: int
     yoy_growth_percentage: Optional[float]
 
 class CategoryPenetration(BaseModel):
@@ -46,95 +47,122 @@ router = APIRouter()
 async def get_category_analysis(ingredient: str = Query(..., description="Ingredient name")):
     try:
         ingredient_pattern = f"'%{ingredient}%'"
+        previous_year = CURRENT_YEAR - 1
         
-        # Distribution query
+        # Distribution query - using overall data with growth from previous_year->CURRENT_YEAR
         category_distribution_query = f"""
-        WITH ingredient_counts AS (
+        WITH overall_counts AS (
+            -- Overall distribution across all years
             SELECT 
                 general_category,
-                year,
-                COUNT(*) AS count
-            FROM ingredient_details
-            WHERE ingredient_name ILIKE {ingredient_pattern}
-            GROUP BY general_category, year
-        ),
-        pivoted AS (
-            SELECT
-                general_category,
-                SUM(CASE WHEN year = 2023 THEN count ELSE 0 END) AS count_2023,
-                SUM(CASE WHEN year = 2024 THEN count ELSE 0 END) AS count_2024
-            FROM ingredient_counts
-            GROUP BY general_category
-        ),
-        total AS (
-            SELECT SUM(count_2024) AS total_2024
-            FROM pivoted
-        )
-        SELECT 
-            p.general_category AS name,
-            p.count_2024 AS dish_count,
-            ROUND(p.count_2024 * 100.0 / NULLIF(t.total_2024, 0), 2) AS value,
-            p.count_2023,
-            ROUND(
-                CASE 
-                    WHEN p.count_2023 = 0 THEN NULL
-                    ELSE ((p.count_2024 - p.count_2023) * 100.0 / p.count_2023)
-                END,
-                2
-            ) AS yoy_growth_percentage
-        FROM pivoted p, total t
-        WHERE p.general_category IS NOT NULL
-        ORDER BY dish_count DESC;
-        """
-        
-        # Penetration query
-        category_penetration_query = f"""
-        WITH category_counts AS (
-            SELECT 
-                general_category,
-                COUNT(*) AS ingredient_count
+                COUNT(DISTINCT dish_id) AS total_dish_count
             FROM ingredient_details
             WHERE ingredient_name ILIKE {ingredient_pattern}
                 AND general_category IS NOT NULL
             GROUP BY general_category
         ),
-        total_counts AS (
+        growth_counts AS (
+            -- Growth calculation: previous_year vs CURRENT_YEAR
             SELECT 
                 general_category,
-                COUNT(*) AS total_count
+                COUNT(DISTINCT CASE WHEN year = {previous_year} THEN dish_id END) AS count_previous,
+                COUNT(DISTINCT CASE WHEN year = {CURRENT_YEAR} THEN dish_id END) AS count_current
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND general_category IS NOT NULL
+            GROUP BY general_category
+        ),
+        total_ingredient_dishes AS (
+            SELECT COUNT(DISTINCT dish_id) AS total
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND general_category IS NOT NULL
+        )
+        SELECT 
+            oc.general_category AS name,
+            oc.total_dish_count AS dish_count,
+            ROUND(oc.total_dish_count * 100.0 / NULLIF(tid.total, 0), 2) AS value,
+            COALESCE(gc.count_previous, 0) AS count_previous,
+            ROUND(
+                CASE 
+                    WHEN gc.count_previous = 0 OR gc.count_previous IS NULL THEN NULL
+                    ELSE ((gc.count_current - gc.count_previous) * 100.0 / NULLIF(gc.count_previous, 0))
+                END,
+                2
+            ) AS yoy_growth_percentage
+        FROM overall_counts oc
+        LEFT JOIN growth_counts gc ON oc.general_category = gc.general_category
+        CROSS JOIN total_ingredient_dishes tid
+        ORDER BY dish_count DESC;
+        """
+        
+        # Penetration query - using overall data with growth from previous_year->CURRENT_YEAR
+        category_penetration_query = f"""
+        WITH ingredient_category_counts AS (
+            -- Overall ingredient presence in each category
+            SELECT 
+                general_category,
+                COUNT(DISTINCT dish_id) AS ingredient_dish_count
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND general_category IS NOT NULL
+            GROUP BY general_category
+        ),
+        total_category_counts AS (
+            -- Total dishes in each category (across all ingredients)
+            SELECT 
+                general_category,
+                COUNT(DISTINCT dish_id) AS total_dish_count
             FROM ingredient_details
             WHERE general_category IS NOT NULL
             GROUP BY general_category
         ),
         growth_data AS (
+            -- Growth calculation: previous_year vs CURRENT_YEAR for penetration
             SELECT 
-                general_category,
-                COUNT(CASE WHEN year = 2024 THEN 1 ELSE NULL END) AS count_2024,
-                COUNT(CASE WHEN year = 2023 THEN 1 ELSE NULL END) AS count_2023
-            FROM ingredient_details
-            WHERE ingredient_name ILIKE {ingredient_pattern}
-                AND general_category IS NOT NULL
-            GROUP BY general_category
+                tc.general_category,
+                COUNT(DISTINCT CASE WHEN id1.year = {previous_year} THEN id1.dish_id END) AS total_previous,
+                COUNT(DISTINCT CASE WHEN id1.year = {CURRENT_YEAR} THEN id1.dish_id END) AS total_current,
+                COUNT(DISTINCT CASE WHEN id1.year = {previous_year} AND id2.ingredient_name ILIKE {ingredient_pattern} THEN id1.dish_id END) AS ingredient_previous,
+                COUNT(DISTINCT CASE WHEN id1.year = {CURRENT_YEAR} AND id2.ingredient_name ILIKE {ingredient_pattern} THEN id1.dish_id END) AS ingredient_current
+            FROM ingredient_details id1
+            LEFT JOIN ingredient_details id2 ON id1.dish_id = id2.dish_id AND id2.ingredient_name ILIKE {ingredient_pattern}
+            JOIN total_category_counts tc ON id1.general_category = tc.general_category
+            WHERE id1.general_category IS NOT NULL
+            GROUP BY tc.general_category
         )
         SELECT 
-            cc.general_category AS name,
-            ROUND((cc.ingredient_count * 100.0 / NULLIF(tc.total_count, 0)), 1) AS penetration,
+            icc.general_category AS name,
+            ROUND((icc.ingredient_dish_count * 100.0 / NULLIF(tcc.total_dish_count, 0)), 1) AS penetration,
+            ROUND(
+                CASE
+                    WHEN gd.total_previous = 0 OR gd.ingredient_previous = 0 THEN 
+                        CASE 
+                            WHEN gd.ingredient_current > 0 THEN 100.0
+                            ELSE 0.0
+                        END
+                    WHEN gd.total_current = 0 THEN 0.0
+                    ELSE 
+                        ((gd.ingredient_current * 100.0 / NULLIF(gd.total_current, 0)) - 
+                         (gd.ingredient_previous * 100.0 / NULLIF(gd.total_previous, 0)))
+                END,
+                1
+            ) AS growth,
             CASE
-                WHEN gd.count_2023 = 0 AND gd.count_2024 > 0 THEN 50.0
-                WHEN gd.count_2023 = 0 THEN 0.0
-                ELSE ROUND((gd.count_2024 - gd.count_2023) * 100.0 / NULLIF(gd.count_2023, 0), 1)
-            END AS growth,
-            CASE
-                WHEN gd.count_2023 = 0 AND gd.count_2024 > 0 THEN 'Hot'
-                WHEN gd.count_2023 = 0 THEN 'New'
-                WHEN gd.count_2024 > gd.count_2023 * 1.25 THEN 'Hot'
-                WHEN gd.count_2024 > gd.count_2023 * 1.1 THEN 'Rising'
-                WHEN gd.count_2024 >= gd.count_2023 * 0.9 THEN 'Stable'
+                WHEN gd.ingredient_previous = 0 AND gd.ingredient_current > 0 THEN 'Hot'
+                WHEN gd.total_previous = 0 OR gd.ingredient_previous = 0 THEN 'New'
+                WHEN gd.total_current = 0 THEN 'Declining'
+                WHEN (gd.ingredient_current * 100.0 / NULLIF(gd.total_current, 0)) > 
+                     (gd.ingredient_previous * 100.0 / NULLIF(gd.total_previous, 0)) * 1.25 THEN 'Hot'
+                WHEN (gd.ingredient_current * 100.0 / NULLIF(gd.total_current, 0)) > 
+                     (gd.ingredient_previous * 100.0 / NULLIF(gd.total_previous, 0)) * 1.1 THEN 'Rising'
+                WHEN (gd.ingredient_current * 100.0 / NULLIF(gd.total_current, 0)) >= 
+                     (gd.ingredient_previous * 100.0 / NULLIF(gd.total_previous, 0)) * 0.9 THEN 'Stable'
                 ELSE 'Declining'
             END AS status
-        FROM category_counts cc
-        JOIN total_counts tc ON cc.general_category = tc.general_category
-        LEFT JOIN growth_data gd ON cc.general_category = gd.general_category
+        FROM ingredient_category_counts icc
+        JOIN total_category_counts tcc ON icc.general_category = tcc.general_category
+        LEFT JOIN growth_data gd ON icc.general_category = gd.general_category
         ORDER BY penetration DESC
         LIMIT 10;
         """
@@ -160,7 +188,7 @@ async def get_category_analysis(ingredient: str = Query(..., description="Ingred
                 name=str(row["name"]),
                 value=float(row["value"]) if row["value"] is not None else 0.0,
                 dish_count=int(row["dish_count"]),
-                count_2023=int(row["count_2023"]) if row["count_2023"] is not None else 0,
+                count_previous=int(row["count_previous"]) if row["count_previous"] is not None else 0,
                 yoy_growth_percentage=float(row["yoy_growth_percentage"]) if row["yoy_growth_percentage"] is not None else None
             ))
         
@@ -250,18 +278,18 @@ def generate_category_insights(penetration: List[CategoryPenetration], distribut
         
         if category.status == 'Hot':
             if category.growth > 50:
-                insight = f"Explosive growth (+{category.growth:.0f}%) with {category.penetration:.1f}% penetration"
+                insight = f"Explosive growth (+{category.growth:.1f}pp) with {category.penetration:.1f}% penetration"
             else:
-                insight = f"Strong momentum (+{category.growth:.0f}%) in established market"
+                insight = f"Strong momentum (+{category.growth:.1f}pp) in established market"
         elif category.status == 'Rising':
-            insight = f"Growing adoption (+{category.growth:.0f}%) with {category.penetration:.1f}% penetration"
+            insight = f"Growing adoption (+{category.growth:.1f}pp) with {category.penetration:.1f}% penetration"
         elif category.status == 'Stable':
             if category.penetration > 50:
                 insight = f"Mature market with {category.penetration:.1f}% penetration, stable performance"
             else:
                 insight = f"Steady {category.penetration:.1f}% penetration, potential for growth"
         elif category.status == 'Declining':
-            insight = f"Declining adoption ({category.growth:.0f}%) despite {category.penetration:.1f}% penetration"
+            insight = f"Declining adoption ({category.growth:.1f}pp) despite {category.penetration:.1f}% penetration"
         else:
             insight = f"Current penetration: {category.penetration:.1f}%"
         
@@ -290,10 +318,10 @@ def generate_summary(ingredient: str, penetration: List[CategoryPenetration], an
     summary += f"{analysis.highest_penetration} leads with {analysis.highest_penetration_rate:.1f}% penetration, "
     
     # Growth insight
-    if analysis.fastest_growth_rate > 30:
-        summary += f"while {analysis.fastest_growing} demonstrates exceptional growth (+{analysis.fastest_growth_rate:.0f}%). "
-    elif analysis.fastest_growth_rate > 10:
-        summary += f"with {analysis.fastest_growing} showing solid growth (+{analysis.fastest_growth_rate:.0f}%). "
+    if analysis.fastest_growth_rate > 5:
+        summary += f"while {analysis.fastest_growing} demonstrates exceptional growth (+{analysis.fastest_growth_rate:.1f}pp). "
+    elif analysis.fastest_growth_rate > 1:
+        summary += f"with {analysis.fastest_growing} showing solid growth (+{analysis.fastest_growth_rate:.1f}pp). "
     else:
         summary += f"with generally stable performance across categories. "
     

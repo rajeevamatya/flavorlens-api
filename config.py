@@ -4,6 +4,8 @@
 from typing import Optional, List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+CURRENT_YEAR = 2024
+
 class Settings(BaseSettings):
     """Application settings."""
     

@@ -9,8 +9,14 @@ class AttributeType(str, Enum):
     flavor = "flavor"
     texture = "texture"
     aroma = "aroma"
-    visual = "visual"
-    # Add more attribute types as needed
+    diet = "diet"
+    functional_health = "functional_health"
+    occasions = "occasions"
+    convenience = "convenience"
+    social = "social"
+    emotional = "emotional"
+    cooking_technique = "cooking_technique"
+
 
 class Attribute(BaseModel):
     name: str
@@ -38,11 +44,34 @@ ATTRIBUTE_CONFIG = {
         "table": "ingredient_aroma",
         "attribute_column": "aroma_attribute"
     },
-    "visual": {
-        "table": "ingredient_visual",
-        "attribute_column": "visual_attribute"
+    "diet": {
+        "table": "ingredient_diet",
+        "attribute_column": "diet_attribute"
+    },
+    "functional_health": {
+        "table": "ingredient_functional_health",
+        "attribute_column": "functional_health_attribute"
+    },
+    "occasions": {
+        "table": "ingredient_occasions",
+        "attribute_column": "occasion_attribute"
+    },
+    "convenience": {
+        "table": "ingredient_convenience",
+        "attribute_column": "convenience_attribute"
+    },
+    "social": {
+        "table": "ingredient_social",
+        "attribute_column": "social_attribute"
+    },
+    "emotional": {
+        "table": "ingredient_emotional",
+        "attribute_column": "emotional_attribute"
+    },
+    "cooking_technique": {
+        "table": "ingredient_cooking_technique",
+        "attribute_column": "cooking_technique_attribute"
     }
-    # Add more configurations as needed
 }
 
 @router.get("/consumer-insights/{attribute_type}", response_model=AttributeInsightsResponse)
@@ -74,7 +103,7 @@ async def get_attribute_insights(
     attribute_column = config["attribute_column"]
     
     try:
-        # Get current distribution
+        # Get current distribution AND determine top 6 attributes
         current_distribution_query = f"""
         WITH attribute_counts AS (
             SELECT 
@@ -95,6 +124,7 @@ async def get_attribute_insights(
         )
         SELECT 
             CONCAT(UPPER(SUBSTR(ac.attribute_name, 1, 1)), LOWER(SUBSTR(ac.attribute_name, 2))) as name,
+            ac.attribute_name as raw_name,
             ROUND(CAST((ac.mention_count * 100.0 / COALESCE(NULLIF(tm.total_count, 0), 1)) AS DECIMAL(10,1))) as percentage,
             ac.mention_count,
             ROUND(CAST(ac.avg_rating AS DECIMAL(10,2))) as avg_rating,
@@ -103,51 +133,62 @@ async def get_attribute_insights(
         FROM attribute_counts ac
         CROSS JOIN total_mentions tm
         ORDER BY percentage DESC
-        LIMIT 10;
+        LIMIT 6;
         """
         
-        # Get trend data over years
-        trends_query = f"""
-        WITH attribute_yearly AS (
-            SELECT 
-                TRY_CAST(year AS INTEGER) as year,
-                LOWER(TRIM({attribute_column})) as attribute_name,
-                COUNT(*) as count
-            FROM {table_name}
-            WHERE ingredient_name ILIKE '%{ingredient}%'
-                AND {attribute_column} IS NOT NULL
-                AND LENGTH(TRIM({attribute_column})) > 0
-                AND year IS NOT NULL
-                AND TRY_CAST(year AS INTEGER) IS NOT NULL
-                AND TRY_CAST(year AS INTEGER) BETWEEN 1900 AND 2030
-            GROUP BY TRY_CAST(year AS INTEGER), LOWER(TRIM({attribute_column}))
-        ),
-        yearly_totals AS (
-            SELECT 
-                year,
-                SUM(count) as total_count
-            FROM attribute_yearly
-            WHERE year IS NOT NULL
-            GROUP BY year
-        ),
-        top_attributes AS (
-            SELECT attribute_name
-            FROM attribute_yearly
-            WHERE year IS NOT NULL
-            GROUP BY attribute_name
-            ORDER BY SUM(count) DESC
-            LIMIT 5
+        # Execute distribution query first to get the definitive top 6
+        distribution_result = await execute_query(
+            current_distribution_query,
+            options=QueryOptions(cacheable=True, ttl=3600000)
         )
-        SELECT 
-            CAST(ay.year AS VARCHAR) as year,
-            CONCAT(UPPER(SUBSTR(ay.attribute_name, 1, 1)), LOWER(SUBSTR(ay.attribute_name, 2))) as attribute_name,
-            ROUND(CAST((ay.count * 100.0 / COALESCE(NULLIF(yt.total_count, 0), 1)) AS DECIMAL(10,1))) as percentage
-        FROM attribute_yearly ay
-        JOIN yearly_totals yt ON ay.year = yt.year
-        WHERE ay.attribute_name IN (SELECT attribute_name FROM top_attributes)
-            AND ay.year IS NOT NULL
-        ORDER BY ay.year, ay.attribute_name;
-        """
+        
+        # Extract the top 6 attribute names for use in trends query
+        top_6_attribute_names = []
+        if distribution_result["rows"]:
+            top_6_attribute_names = [row["raw_name"] for row in distribution_result["rows"]]
+        
+        # Build trends query using the exact top 6 attributes from distribution
+        if top_6_attribute_names:
+            # Create a comma-separated list of quoted attribute names for SQL IN clause
+            attribute_names_sql = "', '".join(top_6_attribute_names)
+            attribute_names_sql = f"'{attribute_names_sql}'"
+            
+            trends_query = f"""
+            WITH attribute_yearly AS (
+                SELECT 
+                    TRY_CAST(year AS INTEGER) as year,
+                    LOWER(TRIM({attribute_column})) as attribute_name,
+                    COUNT(*) as count
+                FROM {table_name}
+                WHERE ingredient_name ILIKE '%{ingredient}%'
+                    AND {attribute_column} IS NOT NULL
+                    AND LENGTH(TRIM({attribute_column})) > 0
+                    AND year IS NOT NULL
+                    AND TRY_CAST(year AS INTEGER) IS NOT NULL
+                    AND TRY_CAST(year AS INTEGER) BETWEEN 1900 AND 2030
+                    AND LOWER(TRIM({attribute_column})) IN ({attribute_names_sql})
+                GROUP BY TRY_CAST(year AS INTEGER), LOWER(TRIM({attribute_column}))
+            ),
+            yearly_totals AS (
+                SELECT 
+                    year,
+                    SUM(count) as total_count
+                FROM attribute_yearly
+                WHERE year IS NOT NULL
+                GROUP BY year
+            )
+            SELECT 
+                CAST(ay.year AS VARCHAR) as year,
+                CONCAT(UPPER(SUBSTR(ay.attribute_name, 1, 1)), LOWER(SUBSTR(ay.attribute_name, 2))) as attribute_name,
+                ROUND(CAST((ay.count * 100.0 / COALESCE(NULLIF(yt.total_count, 0), 1)) AS DECIMAL(10,1))) as percentage
+            FROM attribute_yearly ay
+            JOIN yearly_totals yt ON ay.year = yt.year
+            WHERE ay.year IS NOT NULL
+            ORDER BY ay.year, ay.attribute_name;
+            """
+        else:
+            # Fallback if no distribution data
+            trends_query = "SELECT '' as year, '' as attribute_name, 0 as percentage WHERE 1=0"
         
         # Get detailed attributes for insights
         detailed_attributes_query = f"""
@@ -190,11 +231,6 @@ async def get_attribute_insights(
             )
         
         # Execute queries
-        distribution_result = await execute_query(
-            current_distribution_query,
-            options=QueryOptions(cacheable=True, ttl=3600000)
-        )
-        
         trends_result = await execute_query(
             trends_query, 
             options=QueryOptions(cacheable=True, ttl=3600000)

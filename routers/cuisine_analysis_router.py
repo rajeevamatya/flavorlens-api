@@ -43,38 +43,40 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
         
         # Single comprehensive query for all cuisine analysis data
         cuisine_analysis_query = f"""
-        WITH ingredient_dishes AS (
-            -- Get all dishes containing the ingredient
-            SELECT DISTINCT
-                dish_id,
-                dish_name,
+        WITH overall_cuisine_counts AS (
+            -- Overall distribution across all years
+            SELECT 
                 cuisine,
-                year,
-                star_rating
+                COUNT(DISTINCT dish_id) AS total_dish_count,
+                AVG(star_rating) as avg_rating
             FROM ingredient_details
             WHERE ingredient_name ILIKE {ingredient_pattern}
                 AND cuisine IS NOT NULL
                 AND cuisine != ''
-                AND ingredient_role = 'flavor-aromatic'
-        ),
-        cuisine_metrics AS (
-            -- Calculate metrics per cuisine
-            SELECT 
-                cuisine,
-                COUNT(DISTINCT dish_id) as dish_count,
-                COUNT(CASE WHEN year = 2024 THEN 1 END) as count_2024,
-                COUNT(CASE WHEN year = 2023 THEN 1 END) as count_2023,
-                AVG(star_rating) as avg_rating
-            FROM ingredient_dishes
             GROUP BY cuisine
         ),
-        total_dishes AS (
-            -- Get total dishes for percentage calculation
-            SELECT SUM(dish_count) as total_count
-            FROM cuisine_metrics
+        growth_counts AS (
+            -- Growth calculation: 2023 vs 2024
+            SELECT 
+                cuisine,
+                COUNT(DISTINCT CASE WHEN year = 2023 THEN dish_id END) AS count_2023,
+                COUNT(DISTINCT CASE WHEN year = 2024 THEN dish_id END) AS count_2024
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND cuisine IS NOT NULL
+                AND cuisine != ''
+            GROUP BY cuisine
+        ),
+        total_ingredient_dishes AS (
+            -- Total ingredient dishes across all cuisines for percentage calculation
+            SELECT COUNT(DISTINCT dish_id) AS total_count
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND cuisine IS NOT NULL
+                AND cuisine != ''
         ),
         cuisine_totals AS (
-            -- Get total dishes per cuisine for penetration calculation
+            -- Total dishes per cuisine (all ingredients) for penetration calculation
             SELECT 
                 cuisine,
                 COUNT(DISTINCT dish_id) as total_cuisine_dishes
@@ -84,23 +86,27 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
             GROUP BY cuisine
         )
         SELECT 
-            cm.cuisine,
-            cm.dish_count,
-            ROUND(cm.dish_count * 100.0 / NULLIF(td.total_count, 0), 1) as percentage,
+            occ.cuisine,
+            occ.total_dish_count as dish_count,
+            ROUND(occ.total_dish_count * 100.0 / NULLIF(tid.total_count, 0), 1) as percentage,
             CASE 
-                WHEN cm.count_2023 = 0 AND cm.count_2024 > 0 THEN 100.0
-                WHEN cm.count_2023 = 0 THEN 0.0
-                ELSE ROUND((cm.count_2024 - cm.count_2023) * 100.0 / NULLIF(cm.count_2023, 0), 1)
+                WHEN gc.count_2023 = 0 OR gc.count_2023 IS NULL THEN 
+                    CASE 
+                        WHEN gc.count_2024 > 0 THEN 100.0
+                        ELSE 0.0
+                    END
+                ELSE ROUND((gc.count_2024 - gc.count_2023) * 100.0 / NULLIF(gc.count_2023, 0), 1)
             END as growth_rate,
-            ROUND(cm.dish_count * 100.0 / NULLIF(ct.total_cuisine_dishes, 0), 1) as penetration_rate,
-            cm.avg_rating,
-            cm.count_2024,
-            cm.count_2023
-        FROM cuisine_metrics cm
-        CROSS JOIN total_dishes td
-        LEFT JOIN cuisine_totals ct ON cm.cuisine = ct.cuisine
-        WHERE cm.dish_count >= 2  -- Filter out cuisines with very few dishes
-        ORDER BY cm.dish_count DESC
+            ROUND(occ.total_dish_count * 100.0 / NULLIF(ct.total_cuisine_dishes, 0), 1) as penetration_rate,
+            occ.avg_rating,
+            COALESCE(gc.count_2024, 0) as count_2024,
+            COALESCE(gc.count_2023, 0) as count_2023
+        FROM overall_cuisine_counts occ
+        LEFT JOIN growth_counts gc ON occ.cuisine = gc.cuisine
+        LEFT JOIN cuisine_totals ct ON occ.cuisine = ct.cuisine
+        CROSS JOIN total_ingredient_dishes tid
+        WHERE occ.total_dish_count >= 2  -- Filter out cuisines with very few dishes
+        ORDER BY occ.total_dish_count DESC
         LIMIT 12;
         """
         
