@@ -27,7 +27,11 @@ class Settings(BaseSettings):
     default_cache_ttl: int = 3600000  # 1 hour in milliseconds
     enable_caching: bool = True
     
-    # CORS settings - Updated for proper cross-origin communication
+    # Rate limiting settings
+    enable_rate_limiting: bool = True
+    global_rate_limit_per_hour: int = 50     # Requests per hour per IP
+    global_rate_limit_per_minute: int = 10   # Burst protection per minute per IP
+    
     # CORS settings - Updated for proper cross-origin communication
     cors_origins: List[str] = [
         "http://localhost:3000",      # Next.js development server

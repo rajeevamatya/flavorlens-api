@@ -1,16 +1,11 @@
 # main.py
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from contextlib import asynccontextmanager
 
-# Rate limiting imports
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-
 # Import routers directly
+
 from routers.summary_stats_router import router as summary_stats_router
 from routers.general_trends_router import router as general_trends_router
 from routers.season_router import router as season_router
@@ -27,16 +22,10 @@ from routers.pairings_router import router as pairings_router
 from routers.consumer_insights_attributes_router import router as consumer_insights_attributes_router
 # from routers.consumer_insights_flavor_router import router as consumer_insights_flavor_router
 
-from database.connection import close_db_connection, get_db_connection
 
-# Initialize rate limiter with global default
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[
-        f"{settings.global_rate_limit_per_hour}/hour",
-        f"{settings.global_rate_limit_per_minute}/minute"
-    ]  # Global limits for ALL endpoints
-)
+
+
+from database.connection import close_db_connection, get_db_connection
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -55,12 +44,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add rate limiter to app state
-app.state.limiter = limiter
-
-# Add rate limit exception handler
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -72,10 +55,11 @@ app.add_middleware(
     max_age=settings.cors_max_age,
 )
 
-# Add SlowAPI middleware (must be after CORS)
-app.add_middleware(SlowAPIMiddleware)
-
 # Include routers
+# app.include_router(temperature_router, prefix="/api", tags=["temperature"])
+# app.include_router(geographic_router, prefix="/api", tags=["geographic"])
+# app.include_router(format_router, prefix="/api", tags=["format"])
+
 app.include_router(summary_stats_router, prefix="/api", tags=["summary-stats"])
 app.include_router(general_trends_router, prefix="/api", tags=["general-trends"])
 app.include_router(season_router, prefix="/api", tags=["season"])
@@ -91,7 +75,10 @@ app.include_router(pairings_router, prefix="/api", tags=["pairings"])
 app.include_router(consumer_insights_attributes_router, prefix="/api", tags=["consumer-insights-attributes"])
 # app.include_router(consumer_insights_flavor_router, prefix="/api", tags=["consumer-insights-flavor"])
 
-# Apply rate limiting to root endpoints
+
+
+
+
 @app.get("/")
 async def root():
     return {"message": "FlavorLens API is running", "status": "healthy"}
