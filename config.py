@@ -40,7 +40,9 @@ class Settings(BaseSettings):
         "http://127.0.0.1:8000",      # Alternative localhost address
         "https://flavorlens.vercel.app",     # Remove trailing slash
         "https://www.flavorlens.vercel.app", # Remove trailing slash
-        "https://*.vercel.app",              # Add wildcard for preview deployments
+        "https://*.vercel.app",  
+        "https://demo.flavorlens.com",    
+        "https://*.flavorlens.com",    
     ]
     cors_allow_credentials: bool = True
     cors_allow_methods: List[str] = ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
