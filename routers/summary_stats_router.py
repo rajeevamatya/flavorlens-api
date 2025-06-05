@@ -47,7 +47,7 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
         ingredient_pattern = f"'%{ingredient}%'"
         previous_year = CURRENT_YEAR - 1
 
-        # Combined query to get all data at once using CURRENT_YEAR and previous year
+        # Combined query to get all data at once including overall statistics
         summary_query = f"""
         WITH yearly_totals AS (
             SELECT 
@@ -58,6 +58,14 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
             WHERE year IN ({previous_year}, {CURRENT_YEAR})
             GROUP BY year, source
         ),
+        yearly_overall_totals AS (
+            SELECT 
+                year,
+                COUNT(DISTINCT dish_id) AS total_dishes_overall
+            FROM ingredient_details
+            WHERE year IN ({previous_year}, {CURRENT_YEAR})
+            GROUP BY year
+        ),
         ingredient_data AS (
             SELECT 
                 year,
@@ -67,6 +75,15 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
             WHERE ingredient_name ILIKE {ingredient_pattern}
                 AND year IN ({previous_year}, {CURRENT_YEAR})
             GROUP BY year, source
+        ),
+        ingredient_overall_data AS (
+            SELECT 
+                year,
+                COUNT(DISTINCT dish_id) AS ingredient_dishes_overall
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND year IN ({previous_year}, {CURRENT_YEAR})
+            GROUP BY year
         )
         SELECT 
             yt.year,
@@ -76,9 +93,18 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
             ROUND(
                 COALESCE(id.ingredient_dishes, 0) * 100.0 / NULLIF(yt.total_dishes, 0), 
                 2
-            ) AS share_percent
+            ) AS share_percent,
+            -- Overall data
+            COALESCE(iod.ingredient_dishes_overall, 0) AS ingredient_dishes_overall,
+            yot.total_dishes_overall,
+            ROUND(
+                COALESCE(iod.ingredient_dishes_overall, 0) * 100.0 / NULLIF(yot.total_dishes_overall, 0), 
+                2
+            ) AS share_percent_overall
         FROM yearly_totals yt
         LEFT JOIN ingredient_data id ON yt.year = id.year AND yt.source = id.source
+        LEFT JOIN yearly_overall_totals yot ON yt.year = yot.year
+        LEFT JOIN ingredient_overall_data iod ON yt.year = iod.year
         ORDER BY yt.year, yt.source;
         """
 
@@ -90,6 +116,7 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
         if not result["rows"]:
             # Return default values if no data
             metrics = [
+                MetricBox(title="Overall Share", value="0.0%", growth="+0.0%", is_positive=True, description="Share across all data sources combined"),
                 MetricBox(title="Recipe Share", value="0.0%", growth="+0.0%", is_positive=True, description="Share of recipes containing this ingredient"),
                 MetricBox(title="Menu Share", value="0.0%", growth="+0.0%", is_positive=True, description="Presence on restaurant menus"),
                 MetricBox(title="Social Content Share", value="0.0%", growth="+0.0%", is_positive=True, description="Share of social content mentions"),
@@ -97,7 +124,7 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
             ]
             return SummaryStatsResponse(ingredient=ingredient, metrics=metrics)
 
-        # Process the results
+        # Process the results by source and year
         data_by_source_year = {}
         for row in result["rows"]:
             key = f"{row['source']}_{row['year']}"
@@ -106,7 +133,19 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
                 'ingredient_dishes': int(row['ingredient_dishes'] or 0)
             }
 
+        # Process overall data (extract from any row since it's the same for each year)
+        overall_data = {}
+        for row in result["rows"]:
+            year = row['year']
+            if year not in overall_data:
+                overall_data[year] = {
+                    'share_percent': float(row['share_percent_overall'] or 0),
+                    'ingredient_dishes': int(row['ingredient_dishes_overall'] or 0)
+                }
+
         # Calculate metrics using CURRENT_YEAR and previous year
+        overall_current = overall_data.get(CURRENT_YEAR, {'share_percent': 0, 'ingredient_dishes': 0})
+        overall_previous = overall_data.get(previous_year, {'share_percent': 0, 'ingredient_dishes': 0})
         recipe_current = data_by_source_year.get(f'recipe_{CURRENT_YEAR}', {'share_percent': 0, 'ingredient_dishes': 0})
         recipe_previous = data_by_source_year.get(f'recipe_{previous_year}', {'share_percent': 0, 'ingredient_dishes': 0})
         menu_current = data_by_source_year.get(f'menu_{CURRENT_YEAR}', {'share_percent': 0, 'ingredient_dishes': 0})
@@ -115,6 +154,7 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
         social_previous = data_by_source_year.get(f'social_{previous_year}', {'share_percent': 0, 'ingredient_dishes': 0})
 
         # Calculate growth rates (percentage point changes)
+        overall_growth = overall_current['share_percent'] - overall_previous['share_percent']
         recipe_growth = recipe_current['share_percent'] - recipe_previous['share_percent']
         menu_growth = menu_current['share_percent'] - menu_previous['share_percent']
         social_growth = social_current['share_percent'] - social_previous['share_percent']
@@ -134,6 +174,13 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
         # Build metrics response
         metrics = [
             MetricBox(
+                title="Overall Share",
+                value=f"{overall_current['share_percent']:.1f}%",
+                growth=f"{overall_growth:+.1f}%",
+                is_positive=overall_growth >= 0,
+                description="Share across all data sources combined"
+            ),
+            MetricBox(
                 title="Recipe Share",
                 value=f"{recipe_current['share_percent']:.1f}%",
                 growth=f"{recipe_growth:+.1f}%",
@@ -147,13 +194,13 @@ async def get_summary_stats(ingredient: str = Query(..., description="Ingredient
                 is_positive=menu_growth >= 0,
                 description="Presence on restaurant menus"
             ),
-            MetricBox(
-                title="Social Content Share",
-                value=f"{social_current['share_percent']:.1f}%",
-                growth=f"{social_growth:+.1f}%",
-                is_positive=social_growth >= 0,
-                description="Share of social content mentions"
-            ),
+            # MetricBox(
+            #     title="Social Content Share",
+            #     value=f"{social_current['share_percent']:.1f}%",
+            #     growth=f"{social_growth:+.1f}%",
+            #     is_positive=social_growth >= 0,
+            #     description="Share of social content mentions"
+            # ),
             MetricBox(
                 title="Adoption Phase",
                 value=lifecycle_phase.value,

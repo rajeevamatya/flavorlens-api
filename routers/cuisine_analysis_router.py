@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Query
 from database.connection import execute_query, QueryOptions
 from pydantic import BaseModel
 from typing import List, Optional
+from config import CURRENT_YEAR  # Import CURRENT_YEAR from config
 
 class CuisineData(BaseModel):
     cuisine: str
@@ -11,22 +12,22 @@ class CuisineData(BaseModel):
     penetration: float
     dish_count: int
 
-class PieChartData(BaseModel):
+class DistributionData(BaseModel):
     name: str
-    value: int
     percentage: float
-    fill: str
+    dish_count: int
 
-class PenetrationGrowthData(BaseModel):
+class PenetrationData(BaseModel):
     name: str
     penetration: float
+    previous_penetration: float
     growth: float
+    dish_count: int
 
 class CuisineAnalysisResponse(BaseModel):
     ingredient: str
-    cuisine_data: List[CuisineData]
-    pie_data: List[PieChartData]
-    penetration_data: List[PenetrationGrowthData]
+    distribution_data: List[DistributionData]  # Top 8 + Others for pie chart
+    penetration_data: List[PenetrationData]   # Top 8 for bar chart
     total_dishes: int
     total_cuisines: int
     highest_growth_cuisine: Optional[CuisineData]
@@ -40,6 +41,7 @@ router = APIRouter()
 async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredient name")):
     try:
         ingredient_pattern = f"'%{ingredient}%'"
+        previous_year = CURRENT_YEAR - 1
         
         # Single comprehensive query for all cuisine analysis data
         cuisine_analysis_query = f"""
@@ -56,11 +58,11 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
             GROUP BY cuisine
         ),
         growth_counts AS (
-            -- Growth calculation: 2023 vs 2024
+            -- Growth calculation: previous year vs current year
             SELECT 
                 cuisine,
-                COUNT(DISTINCT CASE WHEN year = 2023 THEN dish_id END) AS count_2023,
-                COUNT(DISTINCT CASE WHEN year = 2024 THEN dish_id END) AS count_2024
+                COUNT(DISTINCT CASE WHEN year = {previous_year} THEN dish_id END) AS count_previous,
+                COUNT(DISTINCT CASE WHEN year = {CURRENT_YEAR} THEN dish_id END) AS count_current
             FROM ingredient_details
             WHERE ingredient_name ILIKE {ingredient_pattern}
                 AND cuisine IS NOT NULL
@@ -84,30 +86,45 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
             WHERE cuisine IS NOT NULL
                 AND cuisine != ''
             GROUP BY cuisine
+        ),
+        cuisine_totals_by_year AS (
+            -- Total dishes per cuisine by year for year-over-year penetration
+            SELECT 
+                cuisine,
+                COUNT(DISTINCT CASE WHEN year = {previous_year} THEN dish_id END) as total_cuisine_dishes_previous,
+                COUNT(DISTINCT CASE WHEN year = {CURRENT_YEAR} THEN dish_id END) as total_cuisine_dishes_current
+            FROM ingredient_details
+            WHERE cuisine IS NOT NULL
+                AND cuisine != ''
+            GROUP BY cuisine
         )
         SELECT 
             occ.cuisine,
             occ.total_dish_count as dish_count,
             ROUND(occ.total_dish_count * 100.0 / NULLIF(tid.total_count, 0), 1) as percentage,
+            ROUND(gc.count_current * 100.0 / NULLIF(cty.total_cuisine_dishes_current, 0), 1) as current_penetration,
+            ROUND(gc.count_previous * 100.0 / NULLIF(cty.total_cuisine_dishes_previous, 0), 1) as previous_penetration,
             CASE 
-                WHEN gc.count_2023 = 0 OR gc.count_2023 IS NULL THEN 
+                WHEN gc.count_previous = 0 OR gc.count_previous IS NULL OR cty.total_cuisine_dishes_previous = 0 THEN 
                     CASE 
-                        WHEN gc.count_2024 > 0 THEN 100.0
+                        WHEN gc.count_current > 0 AND cty.total_cuisine_dishes_current > 0 THEN 100.0
                         ELSE 0.0
                     END
-                ELSE ROUND((gc.count_2024 - gc.count_2023) * 100.0 / NULLIF(gc.count_2023, 0), 1)
+                ELSE ROUND(((gc.count_current * 100.0 / NULLIF(cty.total_cuisine_dishes_current, 0)) - 
+                           (gc.count_previous * 100.0 / NULLIF(cty.total_cuisine_dishes_previous, 0))) * 
+                           100.0 / NULLIF((gc.count_previous * 100.0 / NULLIF(cty.total_cuisine_dishes_previous, 0)), 0), 1)
             END as growth_rate,
             ROUND(occ.total_dish_count * 100.0 / NULLIF(ct.total_cuisine_dishes, 0), 1) as penetration_rate,
             occ.avg_rating,
-            COALESCE(gc.count_2024, 0) as count_2024,
-            COALESCE(gc.count_2023, 0) as count_2023
+            COALESCE(gc.count_current, 0) as count_current,
+            COALESCE(gc.count_previous, 0) as count_previous
         FROM overall_cuisine_counts occ
         LEFT JOIN growth_counts gc ON occ.cuisine = gc.cuisine
         LEFT JOIN cuisine_totals ct ON occ.cuisine = ct.cuisine
+        LEFT JOIN cuisine_totals_by_year cty ON occ.cuisine = cty.cuisine
         CROSS JOIN total_ingredient_dishes tid
         WHERE occ.total_dish_count >= 2  -- Filter out cuisines with very few dishes
-        ORDER BY occ.total_dish_count DESC
-        LIMIT 12;
+        ORDER BY occ.total_dish_count DESC;
         """
         
         result = await execute_query(
@@ -118,10 +135,8 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
         if not result["rows"]:
             raise HTTPException(status_code=404, detail=f"No cuisine data found for ingredient: {ingredient}")
         
-        # Process the data
+        # Keep original CuisineData for internal calculations
         cuisine_data = []
-        total_dishes = 0
-        colors = ['#00255a', '#199ef3', '#3179c0', '#5590d6', '#84abdd', '#adc5e5', '#c3d5ec', '#d1e3f6']
         
         for row in result["rows"]:
             try:
@@ -133,7 +148,6 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
                     dish_count=int(row["dish_count"])
                 )
                 cuisine_data.append(cuisine)
-                total_dishes += cuisine.dish_count
                 
             except Exception as e:
                 print(f"Error processing cuisine row {row}: {e}")
@@ -142,24 +156,50 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
         if not cuisine_data:
             raise HTTPException(status_code=404, detail=f"No valid cuisine data found for ingredient: {ingredient}")
         
-        # Create pie chart data
-        pie_data = []
-        for i, cuisine in enumerate(cuisine_data[:8]):  # Top 8 for pie chart
-            pie_data.append(PieChartData(
+        # Calculate total dishes
+        total_dishes = sum(c.dish_count for c in cuisine_data)
+        
+        # Create distribution data (Top 8 + Others) for pie chart
+        distribution_data = []
+        top_8_cuisines = cuisine_data[:8]
+        remaining_cuisines = cuisine_data[8:]
+        
+        # Add top 8 cuisines
+        top_8_percentage_sum = 0
+        for i, cuisine in enumerate(top_8_cuisines):
+            distribution_data.append(DistributionData(
                 name=cuisine.cuisine,
-                value=cuisine.dish_count,
                 percentage=cuisine.percentage,
-                fill=colors[i % len(colors)]
+                dish_count=cuisine.dish_count
+            ))
+            top_8_percentage_sum += cuisine.percentage
+        
+        # Add "Others" category if there are remaining cuisines
+        if remaining_cuisines:
+            others_dish_count = sum(c.dish_count for c in remaining_cuisines)
+            others_percentage = 100.0 - top_8_percentage_sum
+            
+            distribution_data.append(DistributionData(
+                name="Others",
+                percentage=round(others_percentage, 1),
+                dish_count=others_dish_count
             ))
         
-        # Create penetration/growth data (sorted by penetration for chart)
+        # Create penetration data (Top 8 only) for bar chart - sorted by penetration
         penetration_data = []
-        sorted_cuisines = sorted(cuisine_data[:8], key=lambda x: x.penetration, reverse=True)
+        sorted_cuisines = sorted(top_8_cuisines, key=lambda x: x.penetration, reverse=True)
         for cuisine in sorted_cuisines:
-            penetration_data.append(PenetrationGrowthData(
+            # Find the corresponding row to get current and previous penetration
+            cuisine_row = next((row for row in result["rows"] if row["cuisine"] == cuisine.cuisine), None)
+            current_penetration = float(cuisine_row["current_penetration"]) if cuisine_row and cuisine_row["current_penetration"] is not None else 0.0
+            previous_penetration = float(cuisine_row["previous_penetration"]) if cuisine_row and cuisine_row["previous_penetration"] is not None else 0.0
+            
+            penetration_data.append(PenetrationData(
                 name=cuisine.cuisine,
-                penetration=cuisine.penetration,
-                growth=cuisine.growth
+                penetration=current_penetration,
+                previous_penetration=previous_penetration,
+                growth=cuisine.growth,
+                dish_count=cuisine.dish_count
             ))
         
         # Calculate insights
@@ -178,14 +218,13 @@ async def get_cuisine_analysis(ingredient: str = Query(..., description="Ingredi
         
         return CuisineAnalysisResponse(
             ingredient=ingredient.title(),
-            cuisine_data=cuisine_data,
-            pie_data=pie_data,
-            penetration_data=penetration_data,
+            distribution_data=distribution_data,  # Top 8 + Others for pie chart
+            penetration_data=penetration_data,    # Top 8 for bar chart
             total_dishes=total_dishes,
             total_cuisines=len(cuisine_data),
             highest_growth_cuisine=highest_growth,
             highest_penetration_cuisine=highest_penetration,
-            emerging_cuisines=emerging_cuisines[:5],  # Top 5 emerging
+            emerging_cuisines=emerging_cuisines[:5],
             avg_growth_rate=round(avg_growth, 1)
         )
         

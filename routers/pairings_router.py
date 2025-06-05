@@ -54,8 +54,7 @@ async def get_ingredient_pairings(
         
         # Build the base WHERE conditions
         base_where = f"base_ingredient ILIKE '%{ingredient}%'"
-        pairing_where = f"base_ingredient ILIKE '%{ingredient}%' AND paired_flavor_role != 'background'"
-        
+        pairing_where = f"base_ingredient ILIKE '%{ingredient}%' AND paired_flavor_role != 'background' AND LOWER(base_ingredient) != LOWER(paired_ingredient)"        
         # Category filter
         if category and category.lower() != "all categories":
             safe_category = category.replace("'", "''")

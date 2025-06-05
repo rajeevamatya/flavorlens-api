@@ -19,6 +19,8 @@ class SeasonAnalysis(BaseModel):
     is_seasonal_ingredient: bool
     all_season_usage: float
     total_dishes_analyzed: int
+    dishes_with_season_data: int
+    dishes_without_season_data: int
 
 class SeasonResponse(BaseModel):
     ingredient: str
@@ -50,13 +52,21 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
         debug_result = await execute_query(debug_query)
         print(f"Available seasons for {ingredient}: {debug_result['rows'] if debug_result['rows'] else 'No season data'}")
         
-        # Query with case-insensitive season matching - calculate against overall dataset
+        # Query with case-insensitive season matching - calculate against only dishes with season data
         seasonal_query = f"""
-        WITH overall_ingredient_dishes AS (
+        WITH total_ingredient_dishes AS (
             -- Get total dishes containing this ingredient across all data
             SELECT COUNT(DISTINCT dish_id) AS total_dishes
             FROM ingredient_details
             WHERE ingredient_name ILIKE {ingredient_pattern}
+        ),
+        seasoned_ingredient_dishes AS (
+            -- Get total dishes containing this ingredient that have season data
+            SELECT COUNT(DISTINCT dish_id) AS total_seasoned_dishes
+            FROM ingredient_details
+            WHERE ingredient_name ILIKE {ingredient_pattern}
+                AND season IS NOT NULL
+                AND TRIM(season) != ''
         ),
         ingredient_by_season AS (
             SELECT 
@@ -98,14 +108,16 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
         SELECT 
             s.season AS name,
             ROUND(
-                COALESCE(ibs.ingredient_dishes, 0) * 100.0 / NULLIF(oid.total_dishes, 0), 
+                COALESCE(ibs.ingredient_dishes, 0) * 100.0 / NULLIF(sid.total_seasoned_dishes, 0), 
                 2
             ) AS value,
             COALESCE(ibs.ingredient_dishes, 0) AS dish_count,
-            oid.total_dishes AS total_dishes
+            sid.total_seasoned_dishes AS total_seasoned_dishes,
+            tid.total_dishes AS total_dishes
         FROM all_seasons s
         LEFT JOIN ingredient_by_season ibs ON s.season = ibs.normalized_season
-        CROSS JOIN overall_ingredient_dishes oid
+        CROSS JOIN seasoned_ingredient_dishes sid
+        CROSS JOIN total_ingredient_dishes tid
         ORDER BY 
             CASE 
                 WHEN s.season = 'Spring' THEN 1
@@ -127,6 +139,7 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
 
         # Parse distribution data
         distribution = []
+        total_seasoned_dishes = 0
         total_dishes = 0
         
         print(f"Season distribution results: {result['rows']}")
@@ -136,11 +149,16 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
                 name=str(row["name"]),
                 value=float(row["value"] or 0.0)
             ))
+            if row["total_seasoned_dishes"]:
+                total_seasoned_dishes = int(row["total_seasoned_dishes"])
             if row["total_dishes"]:
                 total_dishes = int(row["total_dishes"])
 
+        # Calculate dishes without season data
+        dishes_without_season_data = total_dishes - total_seasoned_dishes
+
         # Calculate analysis
-        analysis = calculate_seasonal_analysis(distribution, total_dishes)
+        analysis = calculate_seasonal_analysis(distribution, total_seasoned_dishes, total_dishes, dishes_without_season_data)
         
         # Generate summary
         summary = generate_summary(ingredient, distribution, analysis)
@@ -159,7 +177,7 @@ async def get_season_distribution(ingredient: str = Query(..., description="Ingr
         raise HTTPException(status_code=500, detail="Failed to fetch season distribution data")
 
 
-def calculate_seasonal_analysis(distribution: List[SeasonDistribution], total_dishes: int) -> SeasonAnalysis:
+def calculate_seasonal_analysis(distribution: List[SeasonDistribution], total_seasoned_dishes: int, total_dishes: int, dishes_without_season_data: int) -> SeasonAnalysis:
     """Calculate comprehensive seasonal analysis"""
     
     # Separate seasonal data from all-season
@@ -178,7 +196,9 @@ def calculate_seasonal_analysis(distribution: List[SeasonDistribution], total_di
             seasonality_index="Low",
             is_seasonal_ingredient=False,
             all_season_usage=all_season_usage,
-            total_dishes_analyzed=total_dishes
+            total_dishes_analyzed=total_seasoned_dishes,
+            dishes_with_season_data=total_seasoned_dishes,
+            dishes_without_season_data=dishes_without_season_data
         )
     
     # Find peak and lowest seasons
@@ -218,15 +238,24 @@ def calculate_seasonal_analysis(distribution: List[SeasonDistribution], total_di
         seasonality_index=seasonality_index,
         is_seasonal_ingredient=is_seasonal,
         all_season_usage=all_season_usage,
-        total_dishes_analyzed=total_dishes
+        total_dishes_analyzed=total_seasoned_dishes,
+        dishes_with_season_data=total_seasoned_dishes,
+        dishes_without_season_data=dishes_without_season_data
     )
 
 
 def generate_summary(ingredient: str, distribution: List[SeasonDistribution], analysis: SeasonAnalysis) -> str:
     """Generate a human-readable summary of seasonal patterns"""
     
+    # Include information about missing season data
+    data_coverage = f"Analysis based on {analysis.dishes_with_season_data} dishes with season data"
+    if analysis.dishes_without_season_data > 0:
+        total_dishes = analysis.dishes_with_season_data + analysis.dishes_without_season_data
+        coverage_percent = (analysis.dishes_with_season_data / total_dishes) * 100
+        data_coverage += f" ({coverage_percent:.1f}% of {total_dishes} total dishes)"
+    
     if analysis.is_seasonal_ingredient:
-        summary = f"{ingredient.title()} shows strong seasonal preferences, with peak usage in {analysis.peak_season} ({analysis.peak_value:.1f}% of dishes). "
+        summary = f"{ingredient.title()} shows strong seasonal preferences, with peak usage in {analysis.peak_season} ({analysis.peak_value:.1f}% of seasoned dishes). "
         
         if analysis.seasonal_variation > 40:
             summary += f"The ingredient demonstrates high seasonal variation ({analysis.seasonal_variation:.1f}% difference between peak and low seasons), "
@@ -234,9 +263,9 @@ def generate_summary(ingredient: str, distribution: List[SeasonDistribution], an
             summary += f"With moderate seasonal variation ({analysis.seasonal_variation:.1f}% range), "
             
         if analysis.all_season_usage > 20:
-            summary += f"it also maintains significant year-round presence ({analysis.all_season_usage:.1f}% in all-season dishes)."
+            summary += f"it also maintains significant year-round presence ({analysis.all_season_usage:.1f}% in all-season dishes). "
         else:
-            summary += f"it shows limited all-season usage ({analysis.all_season_usage:.1f}%)."
+            summary += f"it shows limited all-season usage ({analysis.all_season_usage:.1f}%). "
             
     else:
         summary = f"{ingredient.title()} demonstrates consistent year-round usage with {analysis.seasonality_index.lower()} seasonal variation. "
@@ -245,10 +274,10 @@ def generate_summary(ingredient: str, distribution: List[SeasonDistribution], an
             summary += f"Strong all-season presence ({analysis.all_season_usage:.1f}%) indicates broad culinary versatility across menu types. "
         
         if analysis.peak_season and analysis.peak_value > 0:
-            summary += f"While showing slight preference for {analysis.peak_season} ({analysis.peak_value:.1f}%), the ingredient maintains balanced usage across seasons."
+            summary += f"While showing slight preference for {analysis.peak_season} ({analysis.peak_value:.1f}%), the ingredient maintains balanced usage across seasons. "
         else:
-            summary += "The ingredient shows balanced usage across all seasons."
+            summary += "The ingredient shows balanced usage across all seasons. "
     
-    summary += f" Analysis based on {analysis.total_dishes_analyzed} total dishes."
+    summary += data_coverage + "."
     
     return summary

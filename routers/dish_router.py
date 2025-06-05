@@ -18,7 +18,8 @@ async def get_top_dishes(
     category: Optional[str] = Query(None, description="Filter by general category"),
     subcategory: Optional[str] = Query(None, description="Filter by specific category"),
     cuisine: Optional[str] = Query(None, description="Filter by cuisine"),
-    country: Optional[str] = Query(None, description="Filter by country")
+    country: Optional[str] = Query(None, description="Filter by country"),
+    min_reviews: int = Query(10, description="Minimum number of reviews required")
 ):
     try:
         ingredient_pattern = f"'%{ingredient}%'"
@@ -41,6 +42,9 @@ async def get_top_dishes(
         
         if country:
             filters.append(f"country ILIKE '%{country}%'")
+        
+        # Add minimum reviews filter
+        filters.append(f"num_ratings >= {min_reviews}")
         
         # Combine all filters
         filter_clause = ""
